@@ -90,6 +90,10 @@ class DinomalyModel(nn.Module):
             class-specific context. This is particularly beneficial for multi-class
             anomaly detection settings. Incompatible with ``remove_class_token=True``.
             Defaults to False.
+        multi_view (bool): Enables multiview mode when multiple images describe an object.
+            Defaults to False.
+        num_views (int): Number of images describing the object in multiview mode.
+            Defaults to 4.
 
     Example:
         >>> model = DinomalyModel(
@@ -110,6 +114,8 @@ class DinomalyModel(nn.Module):
         fuse_layer_decoder: list[list[int]] | None = None,
         remove_class_token: bool = False,
         use_context_recentering: bool = False,
+        multi_view: bool = False,
+        num_views: int = 4,
     ) -> None:
         super().__init__()
 
@@ -155,6 +161,24 @@ class DinomalyModel(nn.Module):
         bottleneck.append(bottle_neck_mlp)
         self.bottleneck = nn.ModuleList(bottleneck)
 
+        self.multi_view = multi_view
+        self.num_views = num_views if multi_view else 1
+
+        if multi_view:
+            # Combines the features of N cameras into one view
+            self.view_fusion = DinomalyMLP(
+                in_features=embed_dim * self.num_views,
+                hidden_features=embed_dim * 2,
+                out_features=embed_dim,
+                act_layer=nn.GELU,
+                drop=0.0,
+                bias=False,
+                apply_input_dropout=False,
+            )
+
+            # This is necessary so that the decoder can restore the features of each camera individually
+            self.camera_embeddings = nn.Embedding(self.num_views, embed_dim)
+
         decoder = []
         for _ in range(decoder_depth):
             # Extract and validate config values for type safety
@@ -194,7 +218,13 @@ class DinomalyModel(nn.Module):
 
         self.loss_fn = CosineHardMiningLoss()
 
-    def get_encoder_decoder_outputs(self, x: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    def get_encoder_decoder_outputs(self, x: torch.Tensor):
+        if self.multi_view:
+            return self._get_encoder_decoder_outputs_multiview(x)
+        else:
+            return self._get_encoder_decoder_outputs_single(x)
+
+    def _get_encoder_decoder_outputs_single(self, x: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Extract and process features through encoder and decoder.
 
         This method processes input images through the DINOv2 encoder to extract
@@ -258,6 +288,147 @@ class DinomalyModel(nn.Module):
         de = self._process_features_for_spatial_output(de, h_patches, w_patches)
         return en, de
 
+    def _get_encoder_decoder_outputs_multiview(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[list[torch.Tensor]], list[list[torch.Tensor]]]:
+        """Extract and process features through encoder and decoder for multi-view input.
+
+        This method processes N views of the same object independently through the frozen DINOv2 encoder,
+        fuses the resulting features into a single object representation using the view fusion
+        module, and reconstructs per-view features using the decoder conditioned on camera
+        embeddings. The fused representation ensures the decoder has full context of all views
+        when reconstructing each individual view.
+
+        Args:
+            x (torch.Tensor): Input images with shape (B, N, C, H, W).
+
+        Returns:
+            tuple containing:
+                - en: List of fused encoder feature maps, each (B, D, H, W)
+                - de_per_view: List of N lists, each containing decoder feature maps (B, D, H, W)
+                - per_view_en: List of N lists, each containing encoder feature maps (B, D, H, W)
+        """
+        B, N, C, H, W = x.shape
+        h_patches = H // self.encoder.patch_size
+        w_patches = W // self.encoder.patch_size
+
+        # Flatten views into the batch dimension for independent per-view encoding
+        x_flat = x.view(B * N, C, H, W)
+        x_flat = self.encoder.prepare_tokens(x_flat)
+
+        # Extract intermediate encoder tensors of dimension (B*N, T, D) from the target layers
+        encoder_features = []
+        for i, block in enumerate(self.encoder.blocks):
+            if i <= self.target_layers[-1]:
+                with torch.no_grad():
+                    x_flat = block(x_flat)
+            else:
+                continue
+            if i in self.target_layers:
+                encoder_features.append(x_flat)
+
+        # Remove the class token and register tokens from all feature maps
+        # In multi-view mode this must be done before reshaping back to (B, N, T, D),
+        # so that T contains only patch tokens and the view dimension is unambiguous
+        if self.remove_class_token:
+            encoder_features = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in encoder_features]
+        elif self.use_context_recentering:
+            recentered = []
+            for e in encoder_features:
+                cls_token = e[:, 0:1, :]
+                patch_start = 1 + self.encoder.num_register_tokens
+                patches = e[:, patch_start:, :] - cls_token
+                recentered.append(patches)
+            encoder_features = recentered
+        else:
+            # Default: remove class token and register tokens without recentering
+            encoder_features = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in encoder_features]
+
+        # Reshape the view dimension: (B*N, T, D) -> (B, N, T, D)
+        T = encoder_features[0].shape[1]
+        D = encoder_features[0].shape[2]
+        encoder_features = [f.view(B, N, T, D) for f in encoder_features]
+
+        # Save per-view features before fusion for anomaly map computation at inference
+        per_view_features = [f.clone() for f in encoder_features]
+
+        # Reshape (B, N, T, D) -> (B, T, N*D)
+        encoder_features_fused = [f.permute(0, 2, 1, 3).reshape(B, T, N * D) for f in encoder_features]
+
+        # View Fusion (B, T, N*D) -> (B, T, D) using a shared MLP
+        encoder_features_fused = [self.view_fusion(f) for f in encoder_features_fused]
+
+        # Average fused features across target layers and pass through the noisy bottleneck MLP
+        x = self._fuse_feature(encoder_features_fused)
+        for block in self.bottleneck:
+            x = block(x)
+        x_bottleneck = x
+
+        # Camera embeddings: (N, D)
+        # Each vector is a "hint" to the decoder about which camera to restore
+        cam_indices = torch.arange(N, device=x_bottleneck.device)
+        cam_embs = self.camera_embeddings(cam_indices)
+
+        # Expand x_bottleneck to create N copies, one per camera view: (B, T, D) -> (B*N, T, D)
+        x_expanded = x_bottleneck.unsqueeze(1).expand(-1, N, -1, -1).reshape(B * N, T, D)
+
+        # Expand camera embeddings to match the token sequence
+        cam_embs_expanded = (
+            cam_embs
+            .unsqueeze(1)          # (N, 1, D)
+            .expand(-1, T, -1)     # (N, T, D)
+            .unsqueeze(0)          # (1, N, T, D)
+            .expand(B, -1, -1, -1) # (B, N, T, D)
+            .reshape(B * N, T, D)  # (B*N, T, D)
+        )
+
+        # Condition the bottleneck output on the camera identity
+        x_all_views = x_expanded + cam_embs_expanded
+
+        # Single batched decoder pass for all views simultaneously, output list of (B*N, T, D)
+        # Elements within the batch dimension do not interact via attention
+        decoder_features_all = []
+        x_dec = x_all_views
+        for block in self.decoder:
+            x_dec = block(x_dec, attn_mask=None)
+            decoder_features_all.append(x_dec)
+        decoder_features_all = decoder_features_all[::-1]
+
+        # Reshape (B*N, T, D) -> (B, N, T, D)
+        decoder_features_per_view = [f.reshape(B, N, T, D) for f in decoder_features_all]
+
+        # Group fused encoder features and reshape to spatial maps (B, D, h_patches, w_patches)
+        en = [self._fuse_feature([encoder_features_fused[idx] for idx in idxs]) for idxs in self.fuse_layer_encoder]
+        en = [f.permute(0, 2, 1).reshape(B, -1, h_patches, w_patches).contiguous() for f in en]
+
+        # Group decoder features separately for each camera view
+        # de_per_view is list of N lists of tensors (B, D, h_patches, w_patches)
+        de_per_view = []
+        for view_idx in range(N):
+            view_dec_layers = [
+                decoder_features_per_view[layer_idx][:, view_idx, :, :]
+                for layer_idx in range(len(decoder_features_per_view))
+            ]
+
+            de_view = [self._fuse_feature([view_dec_layers[idx] for idx in idxs]) for idxs in self.fuse_layer_decoder]
+            de_view = [f.permute(0, 2, 1).reshape(B, -1, h_patches, w_patches).contiguous() for f in de_view]
+            de_per_view.append(de_view)
+
+        # Group per-view encoder features (before fusion) separately for each camera view
+        per_view_en = []
+        for view_idx in range(N):
+            view_layers = [
+                per_view_features[layer_idx][:, view_idx, :, :]
+                for layer_idx in range(len(per_view_features))
+            ]
+
+            en_view = [self._fuse_feature([view_layers[idx] for idx in idxs]) for idxs in self.fuse_layer_encoder]
+            en_view = [f.permute(0, 2, 1).reshape(B, -1, h_patches, w_patches).contiguous() for f in en_view]
+            per_view_en.append(en_view)
+
+        return en, de_per_view, per_view_en
+
     def forward(self, batch: torch.Tensor, global_step: int | None = None) -> torch.Tensor | InferenceBatch:
         """Forward pass of the Dinomaly model.
 
@@ -266,32 +437,64 @@ class DinomalyModel(nn.Module):
         anomaly maps by comparing encoder and decoder features using cosine similarity,
         applies Gaussian smoothing, and returns anomaly scores and maps.
 
+        In multi-view mode, the loss is averaged over all camera views, and a per-view anomaly
+        map is produced alongside the aggregated anomaly map.
+
         Args:
-            batch (torch.Tensor): Input batch of images with shape (B, C, H, W).
+            batch (torch.Tensor): Input images.
+                - Single-view: shape (B, C, H, W).
+                - Multi-view:  shape (B, N, C, H, W).
             global_step (int | None): Current training step, used for loss computation.
 
         Returns:
             torch.Tensor | InferenceBatch:
                 - During training: Dictionary containing encoder and decoder features
                   for loss computation.
-                - During inference: InferenceBatch with pred_score (anomaly scores)
-                  and anomaly_map (pixel-level anomaly maps).
+                - During inference: InferenceBatch with pred_score (anomaly scores),
+                  anomaly_map (pixel-level anomaly maps) and per_view_anomaly_map in multi-view mode.
 
         """
         dtype = next(self.encoder.parameters()).dtype
         batch = batch.type(dtype)
-        en, de = self.get_encoder_decoder_outputs(batch)
-        image_size = (batch.shape[2], batch.shape[3])
+
+        if self.multi_view:
+            en, de_per_view, per_view_en = self.get_encoder_decoder_outputs(batch)
+            image_size = (batch.shape[3], batch.shape[4])
+        else:
+            en, de = self.get_encoder_decoder_outputs(batch)
+            image_size = (batch.shape[2], batch.shape[3])
 
         if self.training:
             if global_step is None:
                 error_msg = "global_step must be provided during training"
                 raise ValueError(error_msg)
-
-            return self.loss_fn(encoder_features=en, decoder_features=de, global_step=global_step)
+            if self.multi_view:
+                # Compute loss for each camera view independently and average
+                total_loss = sum(
+                    self.loss_fn(
+                        encoder_features=per_view_en[i],
+                        decoder_features=de_per_view[i],
+                        global_step=global_step,
+                    )
+                    for i in range(self.num_views)
+                ) / self.num_views
+                return total_loss
+            else:
+                return self.loss_fn(encoder_features=en, decoder_features=de, global_step=global_step)
 
         # If inference, calculate anomaly maps, predictions, from the encoder and decoder features.
-        anomaly_map, _ = self.calculate_anomaly_maps(en, de, out_size=image_size)
+        if self.multi_view:
+            # Compute a separate anomaly map for each camera view
+            per_view_maps = []
+            for i in range(self.num_views):
+                view_map, _ = self.calculate_anomaly_maps(per_view_en[i], de_per_view[i], out_size=image_size)
+                per_view_maps.append(view_map)
+            per_view_anomaly_map = torch.cat(per_view_maps, dim=1)
+            anomaly_map = per_view_anomaly_map.mean(dim=1, keepdim=True)
+        else:
+            anomaly_map, _ = self.calculate_anomaly_maps(en, de, out_size=image_size)
+            per_view_anomaly_map = None
+
         anomaly_map_resized = anomaly_map.clone()
 
         # Resize anomaly map for processing
@@ -319,7 +522,11 @@ class DinomalyModel(nn.Module):
             sp_score = topk_vals.mean(dim=1)
         pred_score = sp_score
 
-        return InferenceBatch(pred_score=pred_score, anomaly_map=anomaly_map_resized)
+        return InferenceBatch(
+            pred_score=pred_score,
+            anomaly_map=anomaly_map_resized,
+            per_view_anomaly_map=per_view_anomaly_map,
+        )
 
     @staticmethod
     def calculate_anomaly_maps(
