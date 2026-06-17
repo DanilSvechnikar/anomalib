@@ -159,13 +159,34 @@ class ExportMixin:
             PosixPath('./exports/weights/onnx/model.onnx')
         """
         export_root = _create_export_root(export_root, ExportType.ONNX)
-        input_shape = torch.zeros((1, 3, *input_size)) if input_size else torch.zeros((1, 3, 1, 1))
-        input_shape = input_shape.to(self.device)
-        dynamic_axes = (
-            {"input": {0: "batch_size"}, "output": {0: "batch_size"}}
-            if input_size
-            else {"input": {0: "batch_size", 2: "height", 3: "width"}, "output": {0: "batch_size"}}
-        )
+
+        # Determining whether to use multi-view mode
+        is_multi_view = getattr(self.model, "multi_view")
+        num_views = getattr(self.model, "num_views")
+
+        if is_multi_view:
+            input_shape = (
+                torch.zeros((1, num_views, 3, *input_size))
+                if input_size
+                else torch.zeros((1, num_views, 3, 1, 1))
+            )
+            dynamic_axes = (
+                {"input": {0: "batch_size"}, "output": {0: "batch_size"}}
+                if input_size
+                else {"input": {0: "batch_size", 3: "height", 4: "width"}, "output": {0: "batch_size"}}
+            )
+        else:
+            input_shape = (
+                torch.zeros((1, 3, *input_size))
+                if input_size
+                else torch.zeros((1, 3, 1, 1))
+            )
+            dynamic_axes = (
+                {"input": {0: "batch_size"}, "output": {0: "batch_size"}}
+                if input_size
+                else {"input": {0: "batch_size", 2: "height", 3: "width"}, "output": {0: "batch_size"}}
+            )
+
         onnx_path = export_root / (model_file_name + ".onnx")
         # apply pass through the model to get the output names
         assert isinstance(self, LightningModule)  # mypy

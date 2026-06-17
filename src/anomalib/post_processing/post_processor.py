@@ -82,6 +82,7 @@ class PostProcessor(nn.Module, Callback):
         self._pixel_threshold_metric = F1AdaptiveThreshold(fields=["anomaly_map", "gt_mask"], strict=False)
         self._image_min_max_metric = MinMax(fields=["pred_score"], strict=False)
         self._pixel_min_max_metric = MinMax(fields=["anomaly_map"], strict=False)
+        self._per_view_pixel_min_max_metric = MinMax(fields=["per_view_anomaly_map"], strict=False)
 
         # register buffers to persist threshold and normalization values
         self.register_buffer("_image_threshold", torch.tensor(float("nan")))
@@ -90,6 +91,8 @@ class PostProcessor(nn.Module, Callback):
         self.register_buffer("image_max", torch.tensor(float("nan")))
         self.register_buffer("pixel_min", torch.tensor(float("nan")))
         self.register_buffer("pixel_max", torch.tensor(float("nan")))
+        self.register_buffer("per_view_pixel_min", torch.tensor(float("nan")))
+        self.register_buffer("per_view_pixel_max", torch.tensor(float("nan")))
 
         self._image_threshold: torch.Tensor
         self._pixel_threshold: torch.Tensor
@@ -97,6 +100,8 @@ class PostProcessor(nn.Module, Callback):
         self.image_max: torch.Tensor
         self.pixel_min: torch.Tensor
         self.pixel_max: torch.Tensor
+        self.per_view_pixel_min: torch.Tensor
+        self.per_view_pixel_max: torch.Tensor
 
     def on_validation_batch_end(
         self,
@@ -124,6 +129,7 @@ class PostProcessor(nn.Module, Callback):
             # update normalization metrics
             self._image_min_max_metric.update(outputs)
             self._pixel_min_max_metric.update(outputs)
+            self._per_view_pixel_min_max_metric.update(outputs)
 
     def on_validation_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         """Compute final threshold and normalization values.
@@ -153,6 +159,12 @@ class PostProcessor(nn.Module, Callback):
                 self.pixel_min.copy_(pixel_min)
                 self.pixel_max.copy_(pixel_max)
                 self._pixel_min_max_metric.reset()
+
+            if self._per_view_pixel_min_max_metric.update_called:
+                per_view_pixel_min, per_view_pixel_max = self._per_view_pixel_min_max_metric.compute()
+                self.per_view_pixel_min.copy_(per_view_pixel_min)
+                self.per_view_pixel_max.copy_(per_view_pixel_max)
+                self._per_view_pixel_min_max_metric.reset()
 
     def on_test_batch_end(
         self,
@@ -219,22 +231,43 @@ class PostProcessor(nn.Module, Callback):
         if self.enable_normalization:
             pred_score = self._normalize(pred_score, self.image_min, self.image_max, self.image_threshold)
             anomaly_map = self._normalize(predictions.anomaly_map, self.pixel_min, self.pixel_max, self.pixel_threshold)
+
+            per_view_anomaly_map = (
+                self._normalize(
+                    predictions.per_view_anomaly_map,
+                    self.per_view_pixel_min,
+                    self.per_view_pixel_max,
+                    self.pixel_threshold,
+                )
+                if predictions.per_view_anomaly_map is not None
+                else None
+            )
         else:
             pred_score = predictions.pred_score
             anomaly_map = predictions.anomaly_map
+            per_view_anomaly_map = predictions.per_view_anomaly_map
 
         if self.enable_thresholding:
             pred_label = self._apply_threshold(pred_score, self.normalized_image_threshold)
             pred_mask = self._apply_threshold(anomaly_map, self.normalized_pixel_threshold)
+
+            per_view_pred_mask = (
+                self._apply_threshold(per_view_anomaly_map, self.normalized_pixel_threshold)
+                if per_view_anomaly_map is not None
+                else None
+            )
         else:
             pred_label = None
             pred_mask = None
+            per_view_pred_mask = None
 
         return InferenceBatch(
             pred_label=pred_label,
             pred_score=pred_score,
             pred_mask=pred_mask,
             anomaly_map=anomaly_map,
+            per_view_anomaly_map=per_view_anomaly_map,
+            per_view_pred_mask=per_view_pred_mask,
         )
 
     def post_process_batch(self, batch: Batch) -> None:

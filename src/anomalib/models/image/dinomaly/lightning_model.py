@@ -169,6 +169,8 @@ class Dinomaly(AnomalibModule):
         post_processor: PostProcessor | bool = True,
         evaluator: Evaluator | bool = True,
         visualizer: Visualizer | bool = True,
+        multi_view: bool = False,
+        num_views: int = 4,
     ) -> None:
         super().__init__(
             pre_processor=pre_processor,
@@ -186,6 +188,8 @@ class Dinomaly(AnomalibModule):
             fuse_layer_decoder=fuse_layer_decoder,
             remove_class_token=remove_class_token,
             use_context_recentering=use_context_recentering,
+            multi_view=multi_view,
+            num_views=num_views,
         )
 
         if isinstance(precision, str):
@@ -211,8 +215,18 @@ class Dinomaly(AnomalibModule):
         for param in self.model.decoder.parameters():
             param.requires_grad = True
 
+        if multi_view:
+            for param in self.model.view_fusion.parameters():
+                param.requires_grad = True
+            for param in self.model.camera_embeddings.parameters():
+                param.requires_grad = True
+
         self.trainable_modules = torch.nn.ModuleList([self.model.bottleneck, self.model.decoder])
         self._initialize_trainable_modules(self.trainable_modules)
+
+        if multi_view:
+            self.trainable_modules.append(self.model.view_fusion)
+            self.trainable_modules.append(self.model.camera_embeddings)
 
     @classmethod
     def configure_pre_processor(
@@ -314,7 +328,9 @@ class Dinomaly(AnomalibModule):
         del args, kwargs  # These variables are not used.
 
         predictions = self.model(batch.image)
-        return batch.update(pred_score=predictions.pred_score, anomaly_map=predictions.anomaly_map)
+        batch = batch.update(pred_score=predictions.pred_score, anomaly_map=predictions.anomaly_map)
+        batch.per_view_anomaly_map = predictions.per_view_anomaly_map
+        return batch
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
         """Configure optimizer and learning rate scheduler for Dinomaly training.

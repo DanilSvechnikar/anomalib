@@ -41,6 +41,8 @@ class InferenceBatch(NamedTuple):
     pred_label: torch.Tensor | None = None
     anomaly_map: torch.Tensor | None = None
     pred_mask: torch.Tensor | None = None
+    per_view_anomaly_map: torch.Tensor | None = None  # (B, N, H, W)
+    per_view_pred_mask: torch.Tensor | None = None  # (B, N, H, W)
 
 
 @dataclass
