@@ -48,35 +48,35 @@ jobs:
       contents: read
     steps:
       - name: Harden the runner (audit all outbound calls)
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Initial cleanup
-        uses: open-edge-platform/geti-ci/actions/cleanup-runner@7d25e47329bbfcde4ee51ab3581aea8613e245e2
+        uses: open-edge-platform/geti-ci/actions/cleanup-runner@6f29a1ff715a9770e024317f30db57bdc0e16418 # cleanup-runner/v0.1.0
         with:
           type: "initial"
 
       - name: Pre-build cleanup
-        uses: open-edge-platform/geti-ci/actions/cleanup-runner@7d25e47329bbfcde4ee51ab3581aea8613e245e2
+        uses: open-edge-platform/geti-ci/actions/cleanup-runner@6f29a1ff715a9770e024317f30db57bdc0e16418 # cleanup-runner/v0.1.0
         with:
           type: "pre-build"
 
       # Install the latest Docker, since the version available by default on the runners may be outdated
       - name: Set up Docker
-        uses: docker/setup-docker-action@b2189fbf2a6592b51fee7cdd93ee2bfaeba733db # v5.1.0
+        uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5.5.0
 
       - name: Set up Docker Compose
-        uses: docker/setup-compose-action@8cccb8c14b6500aaffebff1aa49c502c34d2e5e6 # v2.1.0
+        uses: docker/setup-compose-action@54042514f505b273907334ae2b9cdbb9a0213c1a # v2.4.0
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           tags: |
             type=sha
@@ -186,12 +186,11 @@ jobs:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
-      # write permissions are required to update PR comments with image sizes
-      pull-requests: write
+      pull-requests: write # write permissions are required to update PR comments with image sizes
     continue-on-error: true
     steps:
       - name: Harden the runner (audit all outbound calls)
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
