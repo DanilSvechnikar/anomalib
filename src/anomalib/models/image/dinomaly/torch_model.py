@@ -136,10 +136,8 @@ class DinomalyModel(nn.Module):
         else:
             self.target_layers = target_layers
 
-        if fuse_layer_encoder is None:
-            self.fuse_layer_encoder = DEFAULT_FUSE_LAYERS
-        if fuse_layer_decoder is None:
-            self.fuse_layer_decoder = DEFAULT_FUSE_LAYERS
+        self.fuse_layer_encoder = DEFAULT_FUSE_LAYERS if fuse_layer_encoder is None else fuse_layer_encoder
+        self.fuse_layer_decoder = DEFAULT_FUSE_LAYERS if fuse_layer_decoder is None else fuse_layer_decoder
 
         self.encoder = TimmFeatureExtractor(
             backbone=encoder_name,
